@@ -1,6 +1,7 @@
 use std::io::stdout;
 
 use crossterm::{
+    event::{self, Event, KeyCode},
     queue,
     style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor},
 };
@@ -56,7 +57,7 @@ struct ProcessState {
     bold: bool,
     italics: bool,
     underlined: bool,
-    parent_interactable_element: Option<InteractableElement>,
+    interactable_element: Option<InteractableElement>,
     currently_selected: bool,
 }
 impl Default for ProcessState {
@@ -68,7 +69,7 @@ impl Default for ProcessState {
             bold: false,
             italics: false,
             underlined: false,
-            parent_interactable_element: None,
+            interactable_element: None,
             currently_selected: false,
         }
     }
@@ -81,7 +82,7 @@ impl ProcessState {
         let mut background_color = self.background_color;
         let mut underlined = self.underlined;
 
-        if self.parent_interactable_element.is_some() {
+        if self.interactable_element.is_some() {
             underlined = true;
             foreground_color = Color::Cyan;
         }
@@ -112,12 +113,13 @@ enum InteractableElement {
 /// Recursively draws elements.
 fn process_element(
     items: &Vec<Node>,
-    selection_index: usize,
-    current_index: &mut Option<usize>,
+    selection_index: Option<usize>,
+    current_index: &mut usize,
     recursion_level: usize,
     process_state: ProcessState,
     mut ended_with_newline: bool,
-) {
+) -> Option<InteractableElement> {
+    let mut return_value = None;
     for item in items {
         match item {
             Node::Text(text) => {
@@ -155,13 +157,18 @@ fn process_element(
                     }
                     "a" => {
                         if let Some(path) = element.attributes.get("href") {
-                            new_process_state.parent_interactable_element =
-                                Some(InteractableElement::Link(path.clone().unwrap_or_default()));
-                            if let Some(current_index_value) = current_index {
-                                if *current_index_value == selection_index {
+                            let path = path.clone().unwrap_or_default();
+                            let interactable_element = InteractableElement::Link(path);
+
+                            new_process_state.interactable_element =
+                                Some(interactable_element.clone());
+
+                            if let Some(selection_index) = selection_index {
+                                if *current_index == selection_index {
                                     new_process_state.currently_selected = true;
+                                    return_value = Some(interactable_element);
                                 }
-                                *current_index_value += 1;
+                                *current_index += 1;
                             }
                         }
                     }
@@ -171,8 +178,7 @@ fn process_element(
                         }
                     }
                 }
-
-                process_element(
+                let result = process_element(
                     &element.children,
                     selection_index,
                     current_index,
@@ -180,6 +186,9 @@ fn process_element(
                     new_process_state.clone(),
                     ended_with_newline,
                 );
+                if result.is_some() {
+                    return_value = result;
+                }
 
                 // restore old process state
                 // i.e. the parent elements style
@@ -194,36 +203,75 @@ fn process_element(
             _ => {}
         }
     }
+    return_value
 }
 
 struct Pop {
     client: Client,
     history: Vec<Webpage>,
+    selected_element: Option<InteractableElement>,
 }
 impl Pop {
     async fn new() -> Self {
         let client = Client::new();
         let history = vec![Webpage::from_str(HOME_PAGE_BODY)];
-        Self { client, history }
+        Self {
+            client,
+            history,
+            selected_element: None,
+        }
     }
     fn get_current_page(&self) -> &Webpage {
         self.history.last().expect("history should never be empty")
     }
-    fn draw(&self) {
+    fn draw(&mut self, selection_index: Option<usize>) {
         let current_page = self.get_current_page();
-        process_element(
+        self.selected_element = process_element(
             &current_page.body.children,
-            0,
-            &mut None,
+            selection_index,
+            &mut 0,
             0,
             ProcessState::default(),
             false,
         );
     }
+    fn run(&mut self) {
+        let mut selection_index = None;
+        loop {
+            self.draw(selection_index);
+            let key = event::read().unwrap();
+            match key {
+                Event::Key(key) => {
+                    if key.is_press() {
+                        match key.code {
+                            KeyCode::Right => match &mut selection_index {
+                                Some(value) => {
+                                    *value += 1;
+                                }
+                                None => {
+                                    selection_index = Some(0);
+                                }
+                            },
+                            KeyCode::Left => match &mut selection_index {
+                                Some(value) => {
+                                    *value = value.saturating_sub(1);
+                                }
+                                None => {
+                                    selection_index = Some(0);
+                                }
+                            },
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let pop = Pop::new().await;
-    pop.draw();
+    let mut pop = Pop::new().await;
+    pop.run();
 }
