@@ -59,6 +59,7 @@ struct RenderState {
     background_color: Color,
     bold: bool,
     italics: bool,
+    underlined: bool,
 }
 impl Default for RenderState {
     fn default() -> Self {
@@ -68,6 +69,7 @@ impl Default for RenderState {
             background_color: Color::Reset,
             bold: false,
             italics: false,
+            underlined: false,
         }
     }
 }
@@ -83,6 +85,9 @@ impl RenderState {
         }
         if self.italics {
             queue!(stdout(), SetAttribute(Attribute::Italic)).unwrap();
+        }
+        if self.underlined {
+            queue!(stdout(), SetAttribute(Attribute::Underlined)).unwrap();
         }
     }
 }
@@ -104,7 +109,8 @@ fn render_element(
                     text = strip_ansi_escapes::strip_str(text);
                     text = trim_repeated_whitespace(&text);
                 }
-                text = String::from(" ") + &text;
+                print!(" ");
+                render_state.format_terminal();
                 print!("{}", text);
                 ended_with_newline = false;
             }
@@ -124,23 +130,20 @@ fn render_element(
                 match element.name.as_str() {
                     "pre" => {
                         new_render_state.respect_whitespace = true;
-                        new_render_state.background_color = Color::Green;
+                        new_render_state.background_color = Color::Black;
                     }
                     "em" => {
                         new_render_state.italics = true;
+                    }
+                    "a" => {
+                        new_render_state.foreground_color = Color::Blue;
+                        new_render_state.underlined = true;
                     }
                     _ => {
                         if element.name.starts_with("h") && element.name.len() == 2 {
                             new_render_state.foreground_color = Color::Red
                         }
                     }
-                }
-
-                // update console style to new render state
-                // this will ex. make <em> tags have their text printed with italics
-                // and make <a> links be highlighted
-                if new_render_state != render_state {
-                    new_render_state.format_terminal();
                 }
 
                 render_element(
