@@ -57,6 +57,7 @@ struct ProcessState {
     italics: bool,
     underlined: bool,
     parent_interactable_element: Option<InteractableElement>,
+    currently_selected: bool,
 }
 impl Default for ProcessState {
     fn default() -> Self {
@@ -68,6 +69,7 @@ impl Default for ProcessState {
             italics: false,
             underlined: false,
             parent_interactable_element: None,
+            currently_selected: false,
         }
     }
 }
@@ -76,16 +78,20 @@ impl ProcessState {
     /// Used for color, italics, bold text, etc
     fn format_terminal(&self) {
         let mut foreground_color = self.foreground_color;
+        let mut background_color = self.background_color;
         let mut underlined = self.underlined;
 
         if self.parent_interactable_element.is_some() {
             underlined = true;
-            foreground_color = Color::Green;
+            foreground_color = Color::Cyan;
+        }
+        if self.currently_selected {
+            background_color = Color::White;
         }
 
         queue!(stdout(), SetAttribute(Attribute::Reset)).unwrap();
         queue!(stdout(), SetForegroundColor(foreground_color)).unwrap();
-        queue!(stdout(), SetBackgroundColor(self.background_color)).unwrap();
+        queue!(stdout(), SetBackgroundColor(background_color)).unwrap();
         if self.bold {
             queue!(stdout(), SetAttribute(Attribute::Bold)).unwrap();
         }
@@ -104,10 +110,10 @@ enum InteractableElement {
 }
 
 /// Recursively draws elements.
-/// Writes/stores all interactable elements in a buffer.
 fn process_element(
     items: &Vec<Node>,
-    interactables_buf: &mut Vec<(String, InteractableElement)>,
+    selection_index: usize,
+    current_index: &mut Option<usize>,
     recursion_level: usize,
     process_state: ProcessState,
     mut ended_with_newline: bool,
@@ -126,11 +132,6 @@ fn process_element(
                 process_state.format_terminal();
                 print!("{}", text);
                 ended_with_newline = false;
-
-                // if this text is part of an interactable element, add it to the interactables buffer
-                if let Some(interactable) = &process_state.parent_interactable_element {
-                    interactables_buf.push((text, interactable.clone()));
-                }
             }
             Node::Element(element) => {
                 let mut new_process_state = process_state.clone();
@@ -156,6 +157,12 @@ fn process_element(
                         if let Some(path) = element.attributes.get("href") {
                             new_process_state.parent_interactable_element =
                                 Some(InteractableElement::Link(path.clone().unwrap_or_default()));
+                            if let Some(current_index_value) = current_index {
+                                if *current_index_value == selection_index {
+                                    new_process_state.currently_selected = true;
+                                }
+                                *current_index_value += 1;
+                            }
                         }
                     }
                     _ => {
@@ -167,7 +174,8 @@ fn process_element(
 
                 process_element(
                     &element.children,
-                    interactables_buf,
+                    selection_index,
+                    current_index,
                     recursion_level + 1,
                     new_process_state.clone(),
                     ended_with_newline,
@@ -203,10 +211,10 @@ impl Pop {
     }
     fn draw(&self) {
         let current_page = self.get_current_page();
-        let mut interactable_elements = Vec::new();
         process_element(
             &current_page.body.children,
-            &mut interactable_elements,
+            0,
+            &mut None,
             0,
             ProcessState::default(),
             false,
