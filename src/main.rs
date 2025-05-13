@@ -1,11 +1,8 @@
-use std::io::{Stdout, stdout};
+use std::io::stdout;
 
 use crossterm::{
     queue,
-    style::{
-        Attribute, Attributes, Color, SetAttribute, SetAttributes, SetBackgroundColor,
-        SetForegroundColor,
-    },
+    style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor},
 };
 use html_parser::{Dom, Node};
 use reqwest::{Client, Response, Url};
@@ -48,20 +45,20 @@ const IGNORE_ELEMENTS: &[&str] = &["style", "script", "title"];
 
 fn trim_repeated_whitespace(s: &str) -> String {
     let words: Vec<_> = s.split_whitespace().collect();
-    let mut text = words.join(" ");
-    text
+    words.join(" ")
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct RenderState {
+#[derive(Clone, PartialEq, Eq)]
+struct ProcessState {
     respect_whitespace: bool,
     foreground_color: Color,
     background_color: Color,
     bold: bool,
     italics: bool,
     underlined: bool,
+    parent_interactable_element: Option<InteractableElement>,
 }
-impl Default for RenderState {
+impl Default for ProcessState {
     fn default() -> Self {
         Self {
             respect_whitespace: false,
@@ -70,15 +67,24 @@ impl Default for RenderState {
             bold: false,
             italics: false,
             underlined: false,
+            parent_interactable_element: None,
         }
     }
 }
-impl RenderState {
+impl ProcessState {
     /// Uses crossterm to apply styles to console output.
     /// Used for color, italics, bold text, etc
     fn format_terminal(&self) {
+        let mut foreground_color = self.foreground_color;
+        let mut underlined = self.underlined;
+
+        if self.parent_interactable_element.is_some() {
+            underlined = true;
+            foreground_color = Color::Green;
+        }
+
         queue!(stdout(), SetAttribute(Attribute::Reset)).unwrap();
-        queue!(stdout(), SetForegroundColor(self.foreground_color)).unwrap();
+        queue!(stdout(), SetForegroundColor(foreground_color)).unwrap();
         queue!(stdout(), SetBackgroundColor(self.background_color)).unwrap();
         if self.bold {
             queue!(stdout(), SetAttribute(Attribute::Bold)).unwrap();
@@ -86,37 +92,48 @@ impl RenderState {
         if self.italics {
             queue!(stdout(), SetAttribute(Attribute::Italic)).unwrap();
         }
-        if self.underlined {
+        if underlined {
             queue!(stdout(), SetAttribute(Attribute::Underlined)).unwrap();
         }
     }
 }
 
-fn render_element(
+#[derive(Clone, PartialEq, Eq)]
+enum InteractableElement {
+    Link(String),
+}
+
+/// Recursively draws elements.
+/// Writes/stores all interactable elements in a buffer.
+fn process_element(
     items: &Vec<Node>,
-    buf: &mut Vec<String>,
+    interactables_buf: &mut Vec<(String, InteractableElement)>,
     recursion_level: usize,
-    render_state: RenderState,
+    process_state: ProcessState,
     mut ended_with_newline: bool,
 ) {
     for item in items {
         match item {
             Node::Text(text) => {
                 let mut text = text.clone();
-                if !render_state.respect_whitespace {
+                if !process_state.respect_whitespace {
                     text = text.replace("\n", "");
                     text = text.replace("\r", "");
                     text = strip_ansi_escapes::strip_str(text);
                     text = trim_repeated_whitespace(&text);
                 }
                 print!(" ");
-                render_state.format_terminal();
+                process_state.format_terminal();
                 print!("{}", text);
                 ended_with_newline = false;
+
+                // if this text is part of an interactable element, add it to the interactables buffer
+                if let Some(interactable) = &process_state.parent_interactable_element {
+                    interactables_buf.push((text, interactable.clone()));
+                }
             }
             Node::Element(element) => {
-                //println!("{} {} {:?}", element.name, recursion_level, render_state);
-                let mut new_render_state = render_state.clone();
+                let mut new_process_state = process_state.clone();
                 if IGNORE_ELEMENTS.contains(&element.name.as_str()) {
                     continue;
                 }
@@ -129,35 +146,37 @@ fn render_element(
 
                 match element.name.as_str() {
                     "pre" => {
-                        new_render_state.respect_whitespace = true;
-                        new_render_state.background_color = Color::Black;
+                        new_process_state.respect_whitespace = true;
+                        new_process_state.background_color = Color::Black;
                     }
                     "em" => {
-                        new_render_state.italics = true;
+                        new_process_state.italics = true;
                     }
                     "a" => {
-                        new_render_state.foreground_color = Color::Blue;
-                        new_render_state.underlined = true;
+                        if let Some(path) = element.attributes.get("href") {
+                            new_process_state.parent_interactable_element =
+                                Some(InteractableElement::Link(path.clone().unwrap_or_default()));
+                        }
                     }
                     _ => {
                         if element.name.starts_with("h") && element.name.len() == 2 {
-                            new_render_state.foreground_color = Color::Red
+                            new_process_state.foreground_color = Color::Red
                         }
                     }
                 }
 
-                render_element(
+                process_element(
                     &element.children,
-                    buf,
+                    interactables_buf,
                     recursion_level + 1,
-                    new_render_state,
+                    new_process_state.clone(),
                     ended_with_newline,
                 );
 
-                // restore old render state
+                // restore old process state
                 // i.e. the parent elements style
-                if new_render_state != render_state {
-                    render_state.format_terminal();
+                if new_process_state != process_state {
+                    process_state.format_terminal();
                 }
                 ended_with_newline = element_needs_linebreak;
                 if element_needs_linebreak {
@@ -184,17 +203,14 @@ impl Pop {
     }
     fn draw(&self) {
         let current_page = self.get_current_page();
-        let mut all_elements = Vec::new();
-        render_element(
+        let mut interactable_elements = Vec::new();
+        process_element(
             &current_page.body.children,
-            &mut all_elements,
+            &mut interactable_elements,
             0,
-            RenderState::default(),
+            ProcessState::default(),
             false,
         );
-        for element in all_elements {
-            println!("{element}");
-        }
     }
 }
 
