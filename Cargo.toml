@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+crossterm = "0.29.0"
 html_parser = "0.7.0"
 reqwest = "0.12.15"
+strip-ansi-escapes = "0.2.1"
 tokio = { version = "1.45.0", features = ["macros", "rt", "rt-multi-thread", "tokio-macros"] }
