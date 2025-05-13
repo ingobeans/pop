@@ -1,29 +1,49 @@
-use std::io::stdout;
+use std::{collections::HashMap, io::stdout, rc::Rc};
 
 use crossterm::{
     event::{self, Event, KeyCode},
     queue,
     style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    terminal,
 };
-use html_parser::{Dom, Node};
 use reqwest::{Client, Response, Url};
+
+use markup5ever_rcdom::{self as rcdom, Node, NodeData};
+
+use html5ever::driver::ParseOpts;
+use html5ever::parse_document;
+use html5ever::tendril::TendrilSink;
+use rcdom::RcDom;
 
 const ERROR_PAGE_BODY: &str = include_str!("error.html");
 const HOME_PAGE_BODY: &str = include_str!("home.html");
 
-async fn parse_html_request(request: Result<Response, reqwest::Error>) -> Dom {
+fn get_error_dom() -> RcDom {
+    let mut bytes = ERROR_PAGE_BODY.as_bytes();
+    
+    parse_document(RcDom::default(), ParseOpts::default())
+        .from_utf8()
+        .read_from(&mut bytes)
+        .expect("error page should be valid html")
+}
+
+async fn parse_html_request(request: Result<Response, reqwest::Error>) -> RcDom {
     if let Ok(response) = request {
         if let Ok(text) = response.text().await {
-            if let Ok(dom) = Dom::parse(&text) {
+            let mut bytes = text.as_bytes();
+            let dom = parse_document(RcDom::default(), ParseOpts::default().clone())
+                .from_utf8()
+                .read_from(&mut bytes);
+            if let Ok(dom) = dom {
                 return dom;
             }
         }
     }
-    Dom::parse(ERROR_PAGE_BODY).expect("error page should be valid html")
+    get_error_dom()
 }
 
 struct Webpage {
-    body: Dom,
+    body: RcDom,
     url: Option<Url>,
 }
 impl Webpage {
@@ -36,8 +56,11 @@ impl Webpage {
         }
     }
     fn from_str(body_text: &str) -> Self {
-        let body = Dom::parse(body_text)
-            .unwrap_or(Dom::parse(ERROR_PAGE_BODY).expect("error page should be valid html"));
+        let mut bytes = body_text.as_bytes();
+        let dom = parse_document(RcDom::default(), ParseOpts::default())
+            .from_utf8()
+            .read_from(&mut bytes);
+        let body = dom.unwrap_or(get_error_dom());
         Self { body, url: None }
     }
 }
@@ -112,7 +135,7 @@ enum InteractableElement {
 
 /// Recursively draws elements.
 fn process_element(
-    items: &Vec<Node>,
+    items: &Vec<Rc<Node>>,
     selection_index: Option<usize>,
     current_index: &mut usize,
     recursion_level: usize,
@@ -121,9 +144,10 @@ fn process_element(
 ) -> Option<InteractableElement> {
     let mut return_value = None;
     for item in items {
-        match item {
-            Node::Text(text) => {
-                let mut text = text.clone();
+        match &item.data {
+            NodeData::Text { contents } => {
+                let mut text = contents.borrow().to_string();
+
                 if !process_state.respect_whitespace {
                     text = text.replace("\n", "");
                     text = text.replace("\r", "");
@@ -135,19 +159,29 @@ fn process_element(
                 print!("{}", text);
                 ended_with_newline = false;
             }
-            Node::Element(element) => {
+            NodeData::Element {
+                name,
+                attrs,
+                template_contents: _,
+                mathml_annotation_xml_integration_point: _,
+            } => {
+                let name = name.local.to_string();
                 let mut new_process_state = process_state.clone();
-                if IGNORE_ELEMENTS.contains(&element.name.as_str()) {
+                if IGNORE_ELEMENTS.contains(&name.as_str()) {
                     continue;
                 }
                 let element_needs_linebreak =
-                    ["p", "pre"].contains(&element.name.as_str()) || element.name.starts_with("h");
+                    ["p", "pre"].contains(&name.as_str()) || name.starts_with("h");
 
                 if element_needs_linebreak && !ended_with_newline {
                     println!();
                 }
+                let mut attributes_map = HashMap::new();
+                for a in attrs.borrow().iter() {
+                    attributes_map.insert(a.name.local.to_string(), a.value.to_string());
+                }
 
-                match element.name.as_str() {
+                match name.as_str() {
                     "pre" => {
                         new_process_state.respect_whitespace = true;
                         new_process_state.background_color = Color::Black;
@@ -156,9 +190,8 @@ fn process_element(
                         new_process_state.italics = true;
                     }
                     "a" => {
-                        if let Some(path) = element.attributes.get("href") {
-                            let path = path.clone().unwrap_or_default();
-                            let interactable_element = InteractableElement::Link(path);
+                        if let Some(path) = attributes_map.get("href") {
+                            let interactable_element = InteractableElement::Link(path.clone());
 
                             new_process_state.interactable_element =
                                 Some(interactable_element.clone());
@@ -173,13 +206,13 @@ fn process_element(
                         }
                     }
                     _ => {
-                        if element.name.starts_with("h") && element.name.len() == 2 {
+                        if name.starts_with("h") && name.len() == 2 {
                             new_process_state.foreground_color = Color::Red
                         }
                     }
                 }
                 let result = process_element(
-                    &element.children,
+                    &item.children.clone().into_inner(),
                     selection_index,
                     current_index,
                     recursion_level + 1,
@@ -226,8 +259,9 @@ impl Pop {
     }
     fn draw(&mut self, selection_index: Option<usize>) {
         let current_page = self.get_current_page();
+        queue!(stdout(), terminal::Clear(terminal::ClearType::All)).unwrap();
         self.selected_element = process_element(
-            &current_page.body.children,
+            &current_page.body.document.children.clone().into_inner(),
             selection_index,
             &mut 0,
             0,
@@ -240,31 +274,28 @@ impl Pop {
         loop {
             self.draw(selection_index);
             let key = event::read().unwrap();
-            match key {
-                Event::Key(key) => {
-                    if key.is_press() {
-                        match key.code {
-                            KeyCode::Right => match &mut selection_index {
-                                Some(value) => {
-                                    *value += 1;
-                                }
-                                None => {
-                                    selection_index = Some(0);
-                                }
-                            },
-                            KeyCode::Left => match &mut selection_index {
-                                Some(value) => {
-                                    *value = value.saturating_sub(1);
-                                }
-                                None => {
-                                    selection_index = Some(0);
-                                }
-                            },
-                            _ => {}
-                        }
+            if let Event::Key(key) = key {
+                if key.is_press() {
+                    match key.code {
+                        KeyCode::Right => match &mut selection_index {
+                            Some(value) => {
+                                *value += 1;
+                            }
+                            None => {
+                                selection_index = Some(0);
+                            }
+                        },
+                        KeyCode::Left => match &mut selection_index {
+                            Some(value) => {
+                                *value = value.saturating_sub(1);
+                            }
+                            None => {
+                                selection_index = Some(0);
+                            }
+                        },
+                        _ => {}
                     }
                 }
-                _ => {}
             }
         }
     }
