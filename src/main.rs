@@ -303,8 +303,8 @@ impl Pop {
             .expect("history should never be empty")
     }
     fn draw_current_page(&mut self) {
+        let (screen_width, screen_height) = terminal::size().unwrap();
         let current_page = self.get_current_page();
-        let (_, screen_height) = terminal::size().unwrap();
 
         // render webpage to buffer
         let mut buf: Vec<u8> = Vec::new();
@@ -313,52 +313,69 @@ impl Pop {
         // split buffer to each line
         let mut lines = buf.split(|f| *f == b'\n');
 
-        let vertical_offset = 1;
-
         // draw only the scrolled view
-        let max_line = screen_height as usize - vertical_offset;
+        let max_line = screen_height as isize;
 
-        let mut index = 0;
-        let mut scroll = current_page.scroll;
-        let mut last_line_was_empty = true;
+        let scroll = current_page.scroll;
 
-        loop {
-            if index >= max_line {
-                break;
-            }
-            let line = lines.next();
-            if let Some(line) = line {
-                // discard repeated empty lines
-                if line.is_empty() {
-                    if last_line_was_empty {
+        let mut line_index = scroll as isize * -1;
+
+        queue!(
+            stdout(),
+            cursor::MoveTo(0, 1),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        )
+        .unwrap();
+
+        let skip = (line_index * -1).max(0) as usize;
+
+        let mut in_start = true;
+        while let Some(line) = lines.next() {
+            // strip leading empty lines
+            if in_start {
+                if !line.is_empty() {
+                    // when we reach first non empty line
+                    in_start = false;
+                    if skip > 0 {
+                        for _ in 0..skip - 1 {
+                            lines.next();
+                        }
                         continue;
                     }
-                    last_line_was_empty = true;
                 } else {
-                    last_line_was_empty = false;
-                }
-                queue!(
-                    stdout(),
-                    cursor::MoveTo(0, (index + vertical_offset) as u16),
-                    terminal::Clear(terminal::ClearType::CurrentLine)
-                )
-                .unwrap();
-                if index < scroll {
-                    scroll -= 1;
-
                     continue;
                 }
-                stdout().lock().write_all(line).unwrap();
-            } else {
-                queue!(
-                    stdout(),
-                    cursor::MoveTo(0, (index + vertical_offset) as u16),
-                    terminal::Clear(terminal::ClearType::CurrentLine)
-                )
-                .unwrap();
             }
-            index += 1;
+            if line_index >= max_line {
+                break;
+            }
+            // draw line and break when width is >= screen_width
+            let mut buf: Vec<u8> = Vec::new();
+            for byte in line {
+                let mut new = buf.clone();
+                new.push(*byte);
+                let new_buf_width = String::from_utf8_lossy(&strip_ansi_escapes::strip(new))
+                    .chars()
+                    .count();
+                if new_buf_width >= screen_width as usize {
+                    stdout().lock().write_all(&buf).unwrap();
+                    buf = Vec::new();
+                    queue!(stdout(), cursor::MoveToNextLine(1)).unwrap();
+                    line_index += 1;
+                }
+                buf.push(*byte);
+            }
+            stdout().lock().write_all(&buf).unwrap();
+            queue!(stdout(), cursor::MoveToNextLine(1)).unwrap();
+            line_index += 1;
         }
+
+        queue!(
+            stdout(),
+            terminal::Clear(terminal::ClearType::FromCursorDown)
+        )
+        .unwrap();
+
         self.selected_interactable = selected_interactable;
     }
     fn draw_navbar(&self) {
@@ -370,7 +387,7 @@ impl Pop {
             SetForegroundColor(Color::Black)
         )
         .unwrap();
-        print!("{POP_HEADER} ");
+        stdout().lock().write_all(POP_HEADER.as_bytes()).unwrap();
         queue!(stdout(), ResetColor).unwrap();
     }
     async fn run(&mut self) {
