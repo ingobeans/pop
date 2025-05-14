@@ -281,6 +281,7 @@ static POP_HEADER: &str = "POP    [Q]uit [G]oto page";
 struct Pop {
     client: Client,
     history: Vec<Webpage>,
+    selected_interactable: Option<InteractableElement>,
 }
 impl Pop {
     async fn new() -> Self {
@@ -290,31 +291,24 @@ impl Pop {
             .build()
             .expect("network client should be constructable");
         let history = vec![Webpage::from_str(HOME_PAGE_BODY)];
-        Self { client, history }
+        Self {
+            client,
+            history,
+            selected_interactable: None,
+        }
     }
     fn get_current_page(&mut self) -> &mut Webpage {
         self.history
             .last_mut()
             .expect("history should never be empty")
     }
-    fn draw(&mut self) {
+    fn draw_current_page(&mut self) {
         let current_page = self.get_current_page();
         let (_, screen_height) = terminal::size().unwrap();
 
-        // draw navbar
-        queue!(
-            stdout(),
-            cursor::MoveTo(0, 0),
-            SetBackgroundColor(Color::White),
-            SetForegroundColor(Color::Black)
-        )
-        .unwrap();
-        print!("{POP_HEADER} ");
-        queue!(stdout(), ResetColor).unwrap();
-
         // render webpage to buffer
         let mut buf: Vec<u8> = Vec::new();
-        current_page.process_page(&mut buf);
+        let selected_interactable = current_page.process_page(&mut buf);
 
         // split buffer to each line
         let mut lines = buf.split(|f| *f == b'\n');
@@ -365,6 +359,19 @@ impl Pop {
             }
             index += 1;
         }
+        self.selected_interactable = selected_interactable;
+    }
+    fn draw_navbar(&self) {
+        // draw navbar
+        queue!(
+            stdout(),
+            cursor::MoveTo(0, 0),
+            SetBackgroundColor(Color::White),
+            SetForegroundColor(Color::Black)
+        )
+        .unwrap();
+        print!("{POP_HEADER} ");
+        queue!(stdout(), ResetColor).unwrap();
     }
     async fn run(&mut self) {
         queue!(
@@ -375,72 +382,107 @@ impl Pop {
         .unwrap();
 
         loop {
-            self.draw();
+            self.draw_current_page();
+            self.draw_navbar();
             stdout().flush().unwrap();
             let key = event::read().unwrap();
             if let Event::Key(key) = key {
-                if key.is_press() {
-                    let page: &mut Webpage = self.get_current_page();
-                    let selection_index = &mut page.selection_index;
-                    match key.code {
-                        KeyCode::Right => match selection_index {
-                            Some(value) => {
-                                *value += 1;
-                            }
-                            None => {
-                                *selection_index = Some(0);
-                            }
-                        },
-                        KeyCode::Left => match selection_index {
-                            Some(value) => {
-                                *value = value.saturating_sub(1);
-                            }
-                            None => {
-                                *selection_index = Some(0);
-                            }
-                        },
-                        KeyCode::Down => page.scroll += 1,
-                        KeyCode::Up => page.scroll = page.scroll.saturating_sub(1),
-                        KeyCode::Char(char) => match char {
-                            'q' => {
-                                break;
-                            }
-                            'g' => {
-                                execute!(
-                                    stdout(),
-                                    cursor::Show,
-                                    cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
-                                    terminal::Clear(terminal::ClearType::UntilNewLine)
-                                )
-                                .unwrap();
-                                let mut buf = String::new();
-                                stdin().read_line(&mut buf).unwrap();
-                                queue!(stdout(), cursor::Hide).unwrap();
-                                match Url::parse(&buf) {
-                                    Ok(url) => {
-                                        let webpage = Webpage::from_url(url, &self.client).await;
-                                        self.history.push(webpage);
-                                    }
-                                    Err(e) => {
-                                        queue!(
-                                            stdout(),
-                                            cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
-                                            terminal::Clear(terminal::ClearType::UntilNewLine)
-                                        )
-                                        .unwrap();
-                                        print!("error: {}", e);
+                if !key.is_press() {
+                    continue;
+                }
+                let page: &mut Webpage = self.get_current_page();
+                let page_url = page.url.clone();
+                let selection_index = &mut page.selection_index;
+                match key.code {
+                    KeyCode::Right => match selection_index {
+                        Some(value) => {
+                            *value += 1;
+                        }
+                        None => {
+                            *selection_index = Some(0);
+                        }
+                    },
+                    KeyCode::Left => match selection_index {
+                        Some(value) => {
+                            *value = value.saturating_sub(1);
+                        }
+                        None => {
+                            *selection_index = Some(0);
+                        }
+                    },
+                    KeyCode::Down => page.scroll += 1,
+                    KeyCode::Up => page.scroll = page.scroll.saturating_sub(1),
+                    KeyCode::Enter => {
+                        if let Some(selected_interactable) = &self.selected_interactable {
+                            match selected_interactable {
+                                InteractableElement::Link(link) => {
+                                    let current_url = page_url;
+                                    let options = Url::options().base_url(current_url.as_ref());
+                                    match options.parse(link) {
+                                        Ok(url) => {
+                                            let webpage =
+                                                Webpage::from_url(url, &self.client).await;
+                                            self.history.push(webpage);
+                                        }
+                                        Err(e) => {
+                                            queue!(
+                                                stdout(),
+                                                cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
+                                                terminal::Clear(terminal::ClearType::UntilNewLine)
+                                            )
+                                            .unwrap();
+                                            print!("error: {}", e);
+                                        }
                                     }
                                 }
                             }
-                            _ => {}
-                        },
-                        _ => {}
+                        }
                     }
+                    KeyCode::Char(char) => match char {
+                        'q' => {
+                            break;
+                        }
+                        'g' => {
+                            execute!(
+                                stdout(),
+                                cursor::Show,
+                                cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
+                                terminal::Clear(terminal::ClearType::UntilNewLine)
+                            )
+                            .unwrap();
+                            let mut buf = String::new();
+                            stdin().read_line(&mut buf).unwrap();
+                            queue!(stdout(), cursor::Hide).unwrap();
+                            match Url::parse(&buf) {
+                                Ok(url) => {
+                                    let webpage = Webpage::from_url(url, &self.client).await;
+                                    self.history.push(webpage);
+                                }
+                                Err(e) => {
+                                    queue!(
+                                        stdout(),
+                                        cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
+                                        terminal::Clear(terminal::ClearType::UntilNewLine)
+                                    )
+                                    .unwrap();
+                                    print!("error: {}", e);
+                                }
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
                 }
             }
         }
 
-        queue!(stdout(), cursor::Show).unwrap();
+        queue!(
+            stdout(),
+            cursor::Show,
+            terminal::Clear(terminal::ClearType::All),
+            cursor::MoveTo(0, 0)
+        )
+        .unwrap();
     }
 }
 
