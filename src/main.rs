@@ -1,10 +1,14 @@
-use std::{collections::HashMap, io::stdout, rc::Rc};
+use std::{
+    collections::HashMap,
+    io::{stdin, stdout},
+    rc::Rc,
+};
 
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode},
-    queue,
-    style::{Attribute, Color, SetAttribute, SetBackgroundColor, SetForegroundColor},
+    execute, queue,
+    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal,
 };
 use markup5ever_rcdom::{self as rcdom, Node, NodeData};
@@ -272,6 +276,7 @@ impl Webpage {
         return_value
     }
 }
+static POP_HEADER: &str = "POP    [Q]uit [G]oto page";
 
 struct Pop {
     client: Client,
@@ -279,7 +284,11 @@ struct Pop {
 }
 impl Pop {
     async fn new() -> Self {
-        let client = Client::new();
+        let user_agent = format!("Pop/{}", env!("CARGO_PKG_VERSION"));
+        let client = Client::builder()
+            .user_agent(user_agent)
+            .build()
+            .expect("network client should be constructable");
         let history = vec![Webpage::from_str(HOME_PAGE_BODY)];
         Self { client, history }
     }
@@ -290,7 +299,18 @@ impl Pop {
     }
     fn draw(&mut self) {
         let current_page = self.get_current_page();
-        let screen_height = terminal::size().unwrap().1;
+        let (_, screen_height) = terminal::size().unwrap();
+
+        // draw navbar
+        queue!(
+            stdout(),
+            cursor::MoveTo(0, 0),
+            SetBackgroundColor(Color::White),
+            SetForegroundColor(Color::Black)
+        )
+        .unwrap();
+        print!("{POP_HEADER} ");
+        queue!(stdout(), ResetColor).unwrap();
 
         // render webpage to buffer
         let mut buf: Vec<u8> = Vec::new();
@@ -299,8 +319,10 @@ impl Pop {
         // split buffer to each line
         let mut lines = buf.split(|f| *f == b'\n');
 
+        let vertical_offset = 1;
+
         // draw only the scrolled view
-        let max_line = screen_height as usize;
+        let max_line = screen_height as usize - vertical_offset;
 
         let mut index = 0;
         let mut scroll = current_page.scroll;
@@ -323,7 +345,7 @@ impl Pop {
                 }
                 queue!(
                     stdout(),
-                    cursor::MoveTo(0, index as u16),
+                    cursor::MoveTo(0, (index + vertical_offset) as u16),
                     terminal::Clear(terminal::ClearType::CurrentLine)
                 )
                 .unwrap();
@@ -336,7 +358,7 @@ impl Pop {
             } else {
                 queue!(
                     stdout(),
-                    cursor::MoveTo(0, index as u16),
+                    cursor::MoveTo(0, (index + vertical_offset) as u16),
                     terminal::Clear(terminal::ClearType::CurrentLine)
                 )
                 .unwrap();
@@ -344,13 +366,14 @@ impl Pop {
             index += 1;
         }
     }
-    fn run(&mut self) {
+    async fn run(&mut self) {
         queue!(
             stdout(),
             cursor::Hide,
-            terminal::Clear(terminal::ClearType::All)
+            terminal::Clear(terminal::ClearType::All),
         )
         .unwrap();
+
         loop {
             self.draw();
             stdout().flush().unwrap();
@@ -382,6 +405,33 @@ impl Pop {
                             'q' => {
                                 break;
                             }
+                            'g' => {
+                                execute!(
+                                    stdout(),
+                                    cursor::Show,
+                                    cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
+                                    terminal::Clear(terminal::ClearType::UntilNewLine)
+                                )
+                                .unwrap();
+                                let mut buf = String::new();
+                                stdin().read_line(&mut buf).unwrap();
+                                queue!(stdout(), cursor::Hide).unwrap();
+                                match Url::parse(&buf) {
+                                    Ok(url) => {
+                                        let webpage = Webpage::from_url(url, &self.client).await;
+                                        self.history.push(webpage);
+                                    }
+                                    Err(e) => {
+                                        queue!(
+                                            stdout(),
+                                            cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
+                                            terminal::Clear(terminal::ClearType::UntilNewLine)
+                                        )
+                                        .unwrap();
+                                        print!("error: {}", e);
+                                    }
+                                }
+                            }
                             _ => {}
                         },
                         _ => {}
@@ -397,5 +447,5 @@ impl Pop {
 #[tokio::main]
 async fn main() {
     let mut pop = Pop::new().await;
-    pop.run();
+    pop.run().await;
 }
