@@ -117,6 +117,26 @@ fn trim_repeated_whitespace(s: &str) -> String {
     let words: Vec<_> = s.split_whitespace().collect();
     words.join(" ")
 }
+/// Helper function to draw text to the screen by a coordinate
+fn set_terminal_line(text: &str, x: usize, y: usize, overwrite: bool) -> std::io::Result<()> {
+    if overwrite {
+        queue!(
+            stdout(),
+            cursor::MoveTo(x as u16, y as u16),
+            terminal::Clear(terminal::ClearType::CurrentLine)
+        )?;
+        print!("{text}");
+    } else {
+        queue!(stdout(), cursor::MoveTo(x as u16, y as u16))?;
+        print!("{text}");
+    }
+    Ok(())
+}
+
+struct ProcessResult {
+    tokens: Vec<Token>,
+    selected_element: Option<InteractableElement>,
+}
 
 struct Webpage {
     body: RcDom,
@@ -153,47 +173,45 @@ impl Webpage {
     }
 
     // Draws entire page to buffer
-    fn process_page<T>(&mut self, buf: &mut T) -> Option<InteractableElement>
-    where
-        T: Write,
-    {
-        self.process_element(
-            buf,
+    fn process_page(&mut self) -> ProcessResult {
+        let mut buf: Vec<Token> = Vec::new();
+        let selected = self.process_element(
+            &mut buf,
             &self.body.document.children.clone().into_inner(),
             &mut 0,
             ProcessState::default(),
             false,
-        )
+        );
+        ProcessResult {
+            tokens: buf,
+            selected_element: selected,
+        }
     }
 
     /// Recursively draws elements.
-    fn process_element<T>(
+    fn process_element(
         &mut self,
-        buf: &mut T,
+        buf: &mut Vec<Token>,
         items: &Vec<Rc<Node>>,
         current_index: &mut usize,
         process_state: ProcessState,
         mut ended_with_newline: bool,
-    ) -> Option<InteractableElement>
-    where
-        T: Write,
-    {
+    ) -> Option<InteractableElement> {
         let mut return_value = None;
         for item in items {
             match &item.data {
                 NodeData::Text { contents } => {
                     let mut text = contents.borrow().to_string();
 
+                    text = text.replace("\n", "");
+                    text = text.replace("\r", "");
                     if !process_state.respect_whitespace {
-                        text = text.replace("\n", "");
-                        text = text.replace("\r", "");
-                        text = strip_ansi_escapes::strip_str(text);
                         text = trim_repeated_whitespace(&text);
                     }
                     if !text.is_empty() {
-                        write!(buf, " ").unwrap();
-                        process_state.format_terminal(buf);
-                        write!(buf, "{}", text).unwrap();
+                        buf.push(Token::Padding);
+                        buf.push(Token::Formatting(process_state.clone()));
+                        buf.push(Token::Text(text));
                     }
                     ended_with_newline = false;
                 }
@@ -212,7 +230,7 @@ impl Webpage {
                         ["p", "pre"].contains(&name.as_str()) || name.starts_with("h");
 
                     if element_needs_linebreak && !ended_with_newline {
-                        writeln!(buf,).unwrap();
+                        buf.push(Token::Newline);
                     }
                     let mut attributes_map = HashMap::new();
                     for a in attrs.borrow().iter() {
@@ -263,11 +281,11 @@ impl Webpage {
                     // restore old process state
                     // i.e. the parent elements style
                     if new_process_state != process_state {
-                        process_state.format_terminal(buf);
+                        buf.push(Token::Formatting(process_state.clone()));
                     }
                     ended_with_newline = element_needs_linebreak;
                     if element_needs_linebreak {
-                        writeln!(buf,).unwrap();
+                        buf.push(Token::Newline);
                     }
                 }
                 _ => {}
@@ -278,10 +296,17 @@ impl Webpage {
 }
 static POP_HEADER: &str = "POP    [Q]uit [G]oto page";
 
+enum Token {
+    Text(String),
+    Formatting(ProcessState),
+    Padding,
+    Newline,
+}
+
 struct Pop {
     client: Client,
     history: Vec<Webpage>,
-    selected_interactable: Option<InteractableElement>,
+    selected_element: Option<InteractableElement>,
 }
 impl Pop {
     async fn new() -> Self {
@@ -294,7 +319,7 @@ impl Pop {
         Self {
             client,
             history,
-            selected_interactable: None,
+            selected_element: None,
         }
     }
     fn get_current_page(&mut self) -> &mut Webpage {
@@ -302,93 +327,89 @@ impl Pop {
             .last_mut()
             .expect("history should never be empty")
     }
-    fn draw_current_page(&mut self) {
+    fn draw_current_page<T>(&mut self, mut stdout: T)
+    where
+        T: Write,
+    {
         let (screen_width, screen_height) = terminal::size().unwrap();
+        let (screen_width, screen_height) = (screen_width as usize, screen_height as usize);
         let current_page = self.get_current_page();
 
-        // render webpage to buffer
-        let mut buf: Vec<u8> = Vec::new();
-        let selected_interactable = current_page.process_page(&mut buf);
+        // process webpage
+        let result = current_page.process_page();
+        let last_process_state = ProcessState::default();
 
-        // split buffer to each line
-        let mut lines = buf.split(|f| *f == b'\n');
-
-        // draw only the scrolled view
-        let max_line = screen_height as isize;
-
-        let scroll = current_page.scroll;
-
-        let mut line_index = scroll as isize * -1;
-
+        let mut row_index = 1;
+        let mut column_index = 0;
         queue!(
-            stdout(),
-            cursor::MoveTo(0, 1),
+            stdout,
+            cursor::MoveTo(column_index as u16, row_index as u16),
             terminal::Clear(terminal::ClearType::FromCursorDown)
         )
         .unwrap();
 
-        let skip = (line_index * -1).max(0) as usize;
+        let mut scroll = current_page.scroll;
 
-        let mut in_start = true;
-        while let Some(line) = lines.next() {
-            // strip leading empty lines
-            if in_start {
-                if !line.is_empty() {
-                    // when we reach first non empty line
-                    in_start = false;
-                    if skip > 0 {
-                        for _ in 0..skip - 1 {
-                            lines.next();
+        for token in result.tokens {
+            match token {
+                Token::Text(text) => {
+                    let text_length = text.chars().count();
+                    if text_length + column_index > screen_width {
+                        column_index = 0;
+                        if scroll == 0 {
+                            row_index += 1;
+                            if row_index >= screen_height {
+                                break;
+                            }
+                        } else {
+                            scroll -= 1;
                         }
-                        continue;
                     }
-                } else {
-                    continue;
+                    if scroll == 0 {
+                        set_terminal_line(&text, column_index, row_index, false).unwrap();
+                    }
+                    column_index += text_length;
+                }
+                Token::Newline => {
+                    if scroll == 0 {
+                        row_index += 1;
+                        if row_index >= screen_height {
+                            break;
+                        }
+                    } else {
+                        scroll -= 1;
+                    }
+                    column_index = 0;
+                }
+                Token::Formatting(state) => {
+                    state.format_terminal(&mut stdout);
+                    if last_process_state != state {}
+                }
+                Token::Padding => {
+                    if scroll == 0 {
+                        set_terminal_line(" ", column_index, row_index, false).unwrap();
+                        column_index += 1;
+                    }
                 }
             }
-            if line_index >= max_line {
-                break;
-            }
-            // draw line and break when width is >= screen_width
-            let mut buf: Vec<u8> = Vec::new();
-            for byte in line {
-                let mut new = buf.clone();
-                new.push(*byte);
-                let new_buf_width = String::from_utf8_lossy(&strip_ansi_escapes::strip(new))
-                    .chars()
-                    .count();
-                if new_buf_width >= screen_width as usize {
-                    stdout().lock().write_all(&buf).unwrap();
-                    buf = Vec::new();
-                    queue!(stdout(), cursor::MoveToNextLine(1)).unwrap();
-                    line_index += 1;
-                }
-                buf.push(*byte);
-            }
-            stdout().lock().write_all(&buf).unwrap();
-            queue!(stdout(), cursor::MoveToNextLine(1)).unwrap();
-            line_index += 1;
         }
 
-        queue!(
-            stdout(),
-            terminal::Clear(terminal::ClearType::FromCursorDown)
-        )
-        .unwrap();
-
-        self.selected_interactable = selected_interactable;
+        self.selected_element = result.selected_element;
     }
-    fn draw_navbar(&self) {
+    fn draw_navbar<T>(&self, mut stdout: T)
+    where
+        T: Write,
+    {
         // draw navbar
         queue!(
-            stdout(),
+            stdout,
             cursor::MoveTo(0, 0),
             SetBackgroundColor(Color::White),
             SetForegroundColor(Color::Black)
         )
         .unwrap();
-        stdout().lock().write_all(POP_HEADER.as_bytes()).unwrap();
-        queue!(stdout(), ResetColor).unwrap();
+        stdout.write_all(POP_HEADER.as_bytes()).unwrap();
+        queue!(stdout, ResetColor).unwrap();
     }
     async fn run(&mut self) {
         queue!(
@@ -398,10 +419,11 @@ impl Pop {
         )
         .unwrap();
 
+        let mut stdout = stdout().lock();
         loop {
-            self.draw_current_page();
-            self.draw_navbar();
-            stdout().flush().unwrap();
+            self.draw_current_page(&mut stdout);
+            self.draw_navbar(&mut stdout);
+            stdout.flush().unwrap();
             let key = event::read().unwrap();
             if let Event::Key(key) = key {
                 if !key.is_press() {
@@ -430,7 +452,7 @@ impl Pop {
                     KeyCode::Down => page.scroll += 1,
                     KeyCode::Up => page.scroll = page.scroll.saturating_sub(1),
                     KeyCode::Enter => {
-                        if let Some(selected_interactable) = &self.selected_interactable {
+                        if let Some(selected_interactable) = &self.selected_element {
                             match selected_interactable {
                                 InteractableElement::Link(link) => {
                                     let current_url = page_url;
@@ -443,12 +465,12 @@ impl Pop {
                                         }
                                         Err(e) => {
                                             queue!(
-                                                stdout(),
+                                                stdout,
                                                 cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
                                                 terminal::Clear(terminal::ClearType::UntilNewLine)
                                             )
                                             .unwrap();
-                                            print!("error: {}", e);
+                                            write!(stdout, "error: {}", e).unwrap();
                                         }
                                     }
                                 }
@@ -461,7 +483,7 @@ impl Pop {
                         }
                         'g' => {
                             execute!(
-                                stdout(),
+                                stdout,
                                 cursor::Show,
                                 cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
                                 terminal::Clear(terminal::ClearType::UntilNewLine)
@@ -469,7 +491,7 @@ impl Pop {
                             .unwrap();
                             let mut buf = String::new();
                             stdin().read_line(&mut buf).unwrap();
-                            queue!(stdout(), cursor::Hide).unwrap();
+                            queue!(stdout, cursor::Hide).unwrap();
                             match Url::parse(&buf) {
                                 Ok(url) => {
                                     let webpage = Webpage::from_url(url, &self.client).await;
@@ -477,12 +499,12 @@ impl Pop {
                                 }
                                 Err(e) => {
                                     queue!(
-                                        stdout(),
+                                        stdout,
                                         cursor::MoveTo(POP_HEADER.len() as u16 + 2, 0),
                                         terminal::Clear(terminal::ClearType::UntilNewLine)
                                     )
                                     .unwrap();
-                                    print!("error: {}", e);
+                                    write!(stdout, "error: {}", e).unwrap();
                                 }
                             }
                         }
@@ -494,7 +516,7 @@ impl Pop {
         }
 
         queue!(
-            stdout(),
+            stdout,
             cursor::Show,
             terminal::Clear(terminal::ClearType::All),
             cursor::MoveTo(0, 0)
