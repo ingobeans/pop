@@ -349,9 +349,10 @@ impl Pop {
         .unwrap();
 
         let mut scroll = current_page.scroll;
+        let mut last_was_newline = true;
 
         for token in result.tokens {
-            match token {
+            match &token {
                 Token::Text(text) => {
                     let text_length = text.chars().count();
                     if text_length + column_index > screen_width {
@@ -371,6 +372,9 @@ impl Pop {
                     column_index += text_length;
                 }
                 Token::Newline => {
+                    if last_was_newline {
+                        continue;
+                    }
                     if scroll == 0 {
                         row_index += 1;
                         if row_index >= screen_height {
@@ -383,7 +387,7 @@ impl Pop {
                 }
                 Token::Formatting(state) => {
                     state.format_terminal(&mut stdout);
-                    if last_process_state != state {}
+                    if last_process_state != *state {}
                 }
                 Token::Padding => {
                     if scroll == 0 {
@@ -392,6 +396,7 @@ impl Pop {
                     }
                 }
             }
+            last_was_newline = matches!(token, Token::Newline);
         }
 
         self.selected_element = result.selected_element;
