@@ -227,7 +227,7 @@ impl Webpage {
                         continue;
                     }
                     let element_needs_linebreak =
-                        ["p", "pre"].contains(&name.as_str()) || name.starts_with("h");
+                        ["p", "pre", "li"].contains(&name.as_str()) || name.starts_with("h");
 
                     if element_needs_linebreak && !ended_with_newline {
                         buf.push(Token::Newline);
